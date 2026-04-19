@@ -1,4 +1,7 @@
+import hashlib
+import hmac
 import os
+import re
 import sqlite3
 from datetime import datetime
 
@@ -32,31 +35,98 @@ def ensure_column(conn: sqlite3.Connection, table: str, column: str, column_type
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
 
 
+def hash_password(password: str, salt_hex: str | None = None) -> str:
+    salt = os.urandom(16) if salt_hex is None else bytes.fromhex(salt_hex)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
+    return f"{salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    if "$" not in stored_hash:
+        return False
+    salt_hex, stored_digest = stored_hash.split("$", 1)
+    candidate = hash_password(password, salt_hex=salt_hex)
+    return hmac.compare_digest(candidate.split("$", 1)[1], stored_digest)
+
+
+def normalize_email(email: str) -> str:
+    return email.strip().lower()
+
+
+def is_valid_email(email: str) -> bool:
+    return re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", email) is not None
+
+
+def migrate_legacy_data(conn: sqlite3.Connection) -> None:
+    legacy_user_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'usuario'"
+    ).fetchone()
+
+    if legacy_user_exists:
+        legacy_row = conn.execute("SELECT nome FROM usuario WHERE id = 1").fetchone()
+    else:
+        legacy_row = None
+
+    usuarios_count = conn.execute("SELECT COUNT(*) AS total FROM usuarios").fetchone()["total"]
+
+    if usuarios_count == 0 and legacy_row and (legacy_row["nome"] or "").strip():
+        legacy_nome = (legacy_row["nome"] or "").strip()
+        legacy_email = "legacy@controle.local"
+        legacy_password_hash = hash_password("123456")
+        conn.execute(
+            """
+            INSERT INTO usuarios (nome, email, senha_hash, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (legacy_nome, legacy_email, legacy_password_hash, datetime.now().isoformat(timespec="seconds")),
+        )
+
+    target_user = conn.execute("SELECT id FROM usuarios ORDER BY id ASC LIMIT 1").fetchone()
+    if target_user is not None:
+        conn.execute(
+            """
+            UPDATE movimentacoes
+            SET usuario_id = ?
+            WHERE usuario_id IS NULL
+            """,
+            (int(target_user["id"]),),
+        )
+
+
 def init_db() -> None:
     with get_conn() as conn:
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS usuario (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
+            CREATE TABLE IF NOT EXISTS usuarios (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 nome TEXT NOT NULL,
-                pin TEXT
+                email TEXT NOT NULL UNIQUE,
+                senha_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
             )
             """
         )
-        ensure_column(conn, "usuario", "pin", "TEXT")
 
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS movimentacoes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                usuario_id INTEGER,
                 tipo TEXT NOT NULL,
                 descricao TEXT NOT NULL,
                 categoria TEXT NOT NULL,
                 valor REAL NOT NULL,
-                data_hora TEXT NOT NULL
+                data_hora TEXT NOT NULL,
+                FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
             )
             """
         )
+
+        ensure_column(conn, "movimentacoes", "usuario_id", "INTEGER")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_movimentacoes_usuario_id ON movimentacoes(usuario_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_usuarios_email ON usuarios(email)")
+
+        migrate_legacy_data(conn)
 
 
 def init_session_state() -> None:
@@ -67,53 +137,115 @@ def init_session_state() -> None:
     st.session_state.setdefault("hist_categoria", "Todos")
     st.session_state.setdefault("hist_tipo", "Todos")
 
+    st.session_state.setdefault("auth_mode", "Entrar")
+    st.session_state.setdefault("is_authenticated", False)
+    st.session_state.setdefault("current_user_id", None)
+    st.session_state.setdefault("current_user_name", "")
+    st.session_state.setdefault("current_user_email", "")
+
 
 def reset_action_state() -> None:
     st.session_state["editing_id"] = None
     st.session_state["delete_confirm_id"] = None
 
 
-def get_user() -> dict:
+def reset_history_filters() -> None:
+    st.session_state["hist_search"] = ""
+    st.session_state["hist_mes"] = "Todos"
+    st.session_state["hist_categoria"] = "Todos"
+    st.session_state["hist_tipo"] = "Todos"
+
+
+def set_logged_user(user: dict) -> None:
+    st.session_state["is_authenticated"] = True
+    st.session_state["current_user_id"] = int(user["id"])
+    st.session_state["current_user_name"] = (user["nome"] or "").strip()
+    st.session_state["current_user_email"] = (user["email"] or "").strip()
+
+
+def logout_user() -> None:
+    st.session_state["is_authenticated"] = False
+    st.session_state["current_user_id"] = None
+    st.session_state["current_user_name"] = ""
+    st.session_state["current_user_email"] = ""
+    reset_action_state()
+    reset_history_filters()
+
+
+def get_user_by_id(user_id: int) -> dict | None:
     with get_conn() as conn:
-        row = conn.execute("SELECT nome, COALESCE(pin, '') AS pin FROM usuario WHERE id = 1").fetchone()
+        row = conn.execute("SELECT id, nome, email FROM usuarios WHERE id = ?", (user_id,)).fetchone()
     if not row:
-        return {"nome": "", "pin": ""}
-    return {"nome": (row["nome"] or "").strip(), "pin": (row["pin"] or "").strip()}
+        return None
+    return {"id": int(row["id"]), "nome": row["nome"], "email": row["email"]}
 
 
-def save_user(nome: str) -> None:
+def create_user(nome: str, email: str, senha: str) -> tuple[bool, str]:
+    nome_limpo = nome.strip()
+    email_limpo = normalize_email(email)
+
+    if len(nome_limpo) < 2:
+        return False, "Nome deve ter pelo menos 2 caracteres."
+    if not is_valid_email(email_limpo):
+        return False, "Informe um email valido."
+    if len(senha) < 6:
+        return False, "Senha deve ter no minimo 6 caracteres."
+
+    senha_hash = hash_password(senha)
+
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO usuarios (nome, email, senha_hash, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (nome_limpo, email_limpo, senha_hash, datetime.now().isoformat(timespec="seconds")),
+            )
+    except sqlite3.IntegrityError:
+        return False, "Este email ja esta cadastrado."
+
+    return True, "Conta criada com sucesso."
+
+
+def authenticate_user(email: str, senha: str) -> dict | None:
+    email_limpo = normalize_email(email)
     with get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO usuario (id, nome, pin)
-            VALUES (1, ?, COALESCE((SELECT pin FROM usuario WHERE id = 1), ''))
-            ON CONFLICT(id) DO UPDATE SET nome = excluded.nome
-            """,
-            (nome,),
-        )
+        row = conn.execute(
+            "SELECT id, nome, email, senha_hash FROM usuarios WHERE email = ?",
+            (email_limpo,),
+        ).fetchone()
+
+    if not row:
+        return None
+
+    if not verify_password(senha, row["senha_hash"]):
+        return None
+
+    return {"id": int(row["id"]), "nome": row["nome"], "email": row["email"]}
 
 
-def add_movimentacao(tipo: str, descricao: str, categoria: str, valor: float) -> None:
+def add_movimentacao(user_id: int, tipo: str, descricao: str, categoria: str, valor: float) -> None:
     data_hora = datetime.now().isoformat(timespec="seconds")
     with get_conn() as conn:
         conn.execute(
             """
-            INSERT INTO movimentacoes (tipo, descricao, categoria, valor, data_hora)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO movimentacoes (usuario_id, tipo, descricao, categoria, valor, data_hora)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (tipo.lower(), descricao.strip(), categoria, valor, data_hora),
+            (user_id, tipo.lower(), descricao.strip(), categoria, valor, data_hora),
         )
 
 
-def buscar_movimento(movimento_id: int) -> dict | None:
+def buscar_movimento(movimento_id: int, user_id: int) -> dict | None:
     with get_conn() as conn:
         row = conn.execute(
             """
             SELECT id, data_hora, tipo, descricao, categoria, valor
             FROM movimentacoes
-            WHERE id = ?
+            WHERE id = ? AND usuario_id = ?
             """,
-            (movimento_id,),
+            (movimento_id, user_id),
         ).fetchone()
 
     if not row:
@@ -129,34 +261,39 @@ def buscar_movimento(movimento_id: int) -> dict | None:
     }
 
 
-def editar_movimento(movimento_id: int, tipo: str, descricao: str, categoria: str, valor: float) -> bool:
+def editar_movimento(movimento_id: int, user_id: int, tipo: str, descricao: str, categoria: str, valor: float) -> bool:
     with get_conn() as conn:
         cursor = conn.execute(
             """
             UPDATE movimentacoes
             SET tipo = ?, descricao = ?, categoria = ?, valor = ?
-            WHERE id = ?
+            WHERE id = ? AND usuario_id = ?
             """,
-            (tipo.lower(), descricao.strip(), categoria, valor, movimento_id),
+            (tipo.lower(), descricao.strip(), categoria, valor, movimento_id, user_id),
         )
     return cursor.rowcount > 0
 
 
-def excluir_movimento(movimento_id: int) -> bool:
+def excluir_movimento(movimento_id: int, user_id: int) -> bool:
     with get_conn() as conn:
-        cursor = conn.execute("DELETE FROM movimentacoes WHERE id = ?", (movimento_id,))
+        cursor = conn.execute(
+            "DELETE FROM movimentacoes WHERE id = ? AND usuario_id = ?",
+            (movimento_id, user_id),
+        )
     return cursor.rowcount > 0
 
 
-def load_movimentacoes() -> pd.DataFrame:
+def load_movimentacoes(user_id: int) -> pd.DataFrame:
     with get_conn() as conn:
         df = pd.read_sql_query(
             """
             SELECT id, data_hora, tipo, descricao, categoria, valor
             FROM movimentacoes
+            WHERE usuario_id = ?
             ORDER BY data_hora DESC, id DESC
             """,
             conn,
+            params=(user_id,),
         )
 
     if df.empty:
@@ -304,6 +441,28 @@ def apply_custom_css() -> None:
             padding-top: 1.2rem;
             padding-bottom: 1.8rem;
             max-width: 1080px;
+        }
+        .auth-wrap {
+            max-width: 560px;
+            margin: 1rem auto 0;
+        }
+        .auth-card {
+            background: linear-gradient(180deg, rgba(20, 23, 33, 0.95) 0%, rgba(13, 15, 22, 0.96) 100%);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 20px;
+            padding: 1rem 1.05rem;
+            box-shadow: 0 18px 38px rgba(0, 0, 0, 0.24);
+        }
+        .auth-title {
+            color: #f3f6ff;
+            font-size: 1.2rem;
+            font-weight: 800;
+            margin-bottom: 0.2rem;
+        }
+        .auth-subtitle {
+            color: #adb8d2;
+            font-size: 0.93rem;
+            margin-bottom: 0.8rem;
         }
         .metric-grid {
             display: grid;
@@ -484,6 +643,20 @@ def apply_custom_css() -> None:
                 padding-left: 0.8rem;
                 padding-right: 0.8rem;
             }
+            .auth-wrap {
+                margin-top: 0.5rem;
+            }
+            .auth-card {
+                border-radius: 16px;
+                padding: 0.9rem;
+            }
+            .auth-title {
+                font-size: 1.05rem;
+            }
+            .auth-subtitle {
+                font-size: 0.85rem;
+                margin-bottom: 0.6rem;
+            }
             .metric-grid {
                 grid-template-columns: repeat(2, minmax(0, 1fr));
                 gap: 0.65rem;
@@ -553,25 +726,67 @@ def apply_custom_css() -> None:
     )
 
 
-def render_cadastro() -> None:
-    st.markdown("### Primeiro acesso")
-    st.markdown("Informe seu nome para liberar o painel financeiro.")
+def render_auth_screen() -> None:
+    st.markdown("<div class='auth-wrap'>", unsafe_allow_html=True)
+    st.markdown("<div class='auth-card'>", unsafe_allow_html=True)
+    st.markdown("<div class='auth-title'>Controle Financeiro</div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='auth-subtitle'>Entrar na sua conta ou criar um novo acesso.</div>",
+        unsafe_allow_html=True,
+    )
 
-    with st.form("cadastro_usuario", clear_on_submit=False):
-        nome = st.text_input("Nome", max_chars=60, placeholder="Digite seu nome")
-        salvar = st.form_submit_button("Salvar e continuar", use_container_width=True)
+    modo = st.radio(
+        "Modo",
+        options=["Entrar", "Criar conta"],
+        key="auth_mode",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
 
-    if salvar:
-        nome = nome.strip()
-        if len(nome) < 2:
-            st.error("Digite um nome valido com pelo menos 2 caracteres.")
-            return
-        save_user(nome)
-        st.success("Cadastro concluido.")
-        st.rerun()
+    if modo == "Entrar":
+        with st.form("login_form", clear_on_submit=False):
+            email = st.text_input("Email", placeholder="seuemail@exemplo.com")
+            senha = st.text_input("Senha", type="password", placeholder="Digite sua senha")
+            entrar = st.form_submit_button("Entrar", use_container_width=True)
+
+        if entrar:
+            if not email.strip() or not senha:
+                st.error("Preencha email e senha para entrar.")
+            else:
+                user = authenticate_user(email, senha)
+                if user is None:
+                    st.error("Email ou senha invalidos.")
+                else:
+                    set_logged_user(user)
+                    reset_history_filters()
+                    reset_action_state()
+                    st.success("Login realizado com sucesso.")
+                    st.rerun()
+    else:
+        with st.form("signup_form", clear_on_submit=False):
+            nome = st.text_input("Nome", placeholder="Seu nome")
+            email = st.text_input("Email", placeholder="seuemail@exemplo.com")
+            senha = st.text_input("Senha", type="password", placeholder="Minimo 6 caracteres")
+            confirmar_senha = st.text_input("Confirmar senha", type="password", placeholder="Repita sua senha")
+            criar = st.form_submit_button("Criar conta", use_container_width=True)
+
+        if criar:
+            if senha != confirmar_senha:
+                st.error("Senha e confirmacao precisam ser iguais.")
+            else:
+                ok, mensagem = create_user(nome, email, senha)
+                if not ok:
+                    st.error(mensagem)
+                else:
+                    st.success(mensagem + " Agora faca login.")
+                    st.session_state["auth_mode"] = "Entrar"
+                    st.rerun()
+
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
-def render_nova_movimentacao() -> None:
+def render_nova_movimentacao(user_id: int) -> None:
     st.markdown("<div class='app-card'>", unsafe_allow_html=True)
     st.markdown("### Nova movimentacao")
 
@@ -590,7 +805,7 @@ def render_nova_movimentacao() -> None:
         if mensagem_validacao:
             st.error(mensagem_validacao)
         else:
-            add_movimentacao(tipo=tipo, descricao=descricao, categoria=categoria, valor=float(valor))
+            add_movimentacao(user_id=user_id, tipo=tipo, descricao=descricao, categoria=categoria, valor=float(valor))
             st.success("Movimentacao salva com sucesso.")
             st.rerun()
 
@@ -684,7 +899,7 @@ def render_grafico(df: pd.DataFrame) -> None:
     )
 
 
-def render_edit_form(movimento: dict) -> None:
+def render_edit_form(movimento: dict, user_id: int) -> None:
     st.markdown("<div class='app-card'>", unsafe_allow_html=True)
     st.markdown(f"### Editar movimentacao #{movimento['id']}")
 
@@ -733,7 +948,8 @@ def render_edit_form(movimento: dict) -> None:
             st.error(mensagem_validacao)
         else:
             atualizado = editar_movimento(
-                movimento["id"],
+                movimento_id=movimento["id"],
+                user_id=user_id,
                 tipo=tipo,
                 descricao=descricao,
                 categoria=categoria,
@@ -748,7 +964,7 @@ def render_edit_form(movimento: dict) -> None:
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-def render_movimento_card(row: pd.Series) -> None:
+def render_movimento_card(row: pd.Series, user_id: int) -> None:
     movimento_id = int(row["id"])
     tipo = str(row["tipo"])
     tipo_label = "Receita" if tipo == "receita" else "Despesa"
@@ -781,7 +997,7 @@ def render_movimento_card(row: pd.Series) -> None:
         st.warning("Confirmar exclusao desta movimentacao?")
         confirmar_col1, confirmar_col2 = st.columns(2, gap="small")
         if confirmar_col1.button("Confirmar exclusao", key=f"confirmar_excluir_{movimento_id}", use_container_width=True):
-            removido = excluir_movimento(movimento_id)
+            removido = excluir_movimento(movimento_id, user_id)
             if removido:
                 reset_action_state()
                 st.success("Movimentacao excluida com sucesso.")
@@ -795,17 +1011,17 @@ def render_movimento_card(row: pd.Series) -> None:
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-def render_historico(df: pd.DataFrame) -> None:
+def render_historico(df: pd.DataFrame, user_id: int) -> None:
     st.markdown("### Historico completo")
 
     editing_id = st.session_state.get("editing_id")
     if editing_id is not None:
-        movimento = buscar_movimento(int(editing_id))
+        movimento = buscar_movimento(int(editing_id), user_id)
         if movimento is None:
             cancel_edit()
             st.warning("A movimentacao em edicao nao foi encontrada.")
         else:
-            render_edit_form(movimento)
+            render_edit_form(movimento, user_id)
 
     st.markdown("<div class='filters-card'>", unsafe_allow_html=True)
     st.markdown("<div class='filters-title'>Busca e filtros</div>", unsafe_allow_html=True)
@@ -820,10 +1036,7 @@ def render_historico(df: pd.DataFrame) -> None:
     )
 
     if clear_col.button("Limpar filtros", key="limpar_filtros_historico", use_container_width=True):
-        st.session_state["hist_search"] = ""
-        st.session_state["hist_mes"] = "Todos"
-        st.session_state["hist_categoria"] = "Todos"
-        st.session_state["hist_tipo"] = "Todos"
+        reset_history_filters()
         st.rerun()
 
     month_options = ["Todos"]
@@ -896,20 +1109,27 @@ def render_historico(df: pd.DataFrame) -> None:
         return
 
     for _, row in filtered_df.iterrows():
-        render_movimento_card(row)
+        render_movimento_card(row, user_id)
 
 
-def render_dashboard(nome: str) -> None:
-    st.markdown(f"## Ola, {nome}")
-    st.markdown("<p class='app-subtitle'>Painel financeiro pessoal</p>", unsafe_allow_html=True)
+def render_dashboard(user: dict) -> None:
+    user_id = int(user["id"])
 
-    df = load_movimentacoes()
+    top_left, top_right = st.columns([0.75, 0.25])
+    top_left.markdown(f"## Ola, {user['nome']}")
+    top_left.markdown("<p class='app-subtitle'>Painel financeiro pessoal</p>", unsafe_allow_html=True)
+
+    if top_right.button("Sair", use_container_width=True):
+        logout_user()
+        st.rerun()
+
+    df = load_movimentacoes(user_id)
     metrics = compute_metrics(df)
 
     render_metric_cards(metrics, len(df))
-    render_nova_movimentacao()
+    render_nova_movimentacao(user_id)
     render_grafico(df)
-    render_historico(df)
+    render_historico(df, user_id)
 
 
 def main() -> None:
@@ -924,12 +1144,24 @@ def main() -> None:
     init_session_state()
     apply_custom_css()
 
-    user = get_user()
-    if not user["nome"]:
-        render_cadastro()
+    if not st.session_state["is_authenticated"]:
+        render_auth_screen()
         return
 
-    render_dashboard(user["nome"])
+    current_user_id = st.session_state.get("current_user_id")
+    if current_user_id is None:
+        logout_user()
+        render_auth_screen()
+        return
+
+    user = get_user_by_id(int(current_user_id))
+    if user is None:
+        logout_user()
+        st.warning("Sua sessao expirou. Faca login novamente.")
+        render_auth_screen()
+        return
+
+    render_dashboard(user)
 
 
 if __name__ == "__main__":
