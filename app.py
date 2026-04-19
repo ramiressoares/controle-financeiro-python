@@ -2,7 +2,6 @@ import hashlib
 import hmac
 import os
 import re
-import shutil
 import sqlite3
 from datetime import datetime
 
@@ -23,16 +22,13 @@ CATEGORIAS = [
     "Outros",
 ]
 
-# ── PWA: sincronizacao dos icones personalizados do projeto ───────────────────
+# ── PWA: pasta oficial ─────────────────────────────────────────────────────────
 
-_STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 _PWA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pwa")
-_PWA_VERSION = "3"
 
 
 def init_pwa_icons() -> None:
-    """Sincroniza icones personalizados da pasta pwa/ para static/."""
-    os.makedirs(_STATIC_DIR, exist_ok=True)
+    """Garante os nomes oficiais dos icones dentro da pasta pwa/."""
     os.makedirs(_PWA_DIR, exist_ok=True)
 
     source_map = {
@@ -48,13 +44,13 @@ def init_pwa_icons() -> None:
 
     for filename, candidates in source_map.items():
         source_path = next((candidate for candidate in candidates if os.path.exists(candidate)), None)
-        static_path = os.path.join(_STATIC_DIR, filename)
         pwa_path = os.path.join(_PWA_DIR, filename)
 
-        if source_path is not None:
-            if os.path.abspath(source_path) != os.path.abspath(pwa_path):
-                shutil.copyfile(source_path, pwa_path)
-            shutil.copyfile(pwa_path, static_path)
+        if source_path is not None and os.path.abspath(source_path) != os.path.abspath(pwa_path):
+            with open(source_path, "rb") as source_file:
+                data = source_file.read()
+            with open(pwa_path, "wb") as target_file:
+                target_file.write(data)
 
 
 def get_conn() -> sqlite3.Connection:
@@ -846,30 +842,12 @@ def apply_custom_css() -> None:
 
 
 def inject_pwa() -> None:
-    """Injeta manifest link, meta tags e registro do Service Worker na pagina."""
+    """Injeta o manifest oficial da pasta pwa/."""
     st.markdown(
-                f"""
-                <link rel="manifest" href="/app/static/manifest.webmanifest?v={_PWA_VERSION}">
-        <meta name="mobile-web-app-capable" content="yes">
-        <meta name="apple-mobile-web-app-capable" content="yes">
-        <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-                <meta name="apple-mobile-web-app-title" content="Controle Financeiro">
-                <meta name="theme-color" content="#f5b400">
-                <link rel="apple-touch-icon" href="/app/static/icon-192.png?v={_PWA_VERSION}">
-        <script>
-                    if ('serviceWorker' in navigator) {{
-                        window.addEventListener('load', function () {{
-              navigator.serviceWorker
-                                .register('/app/static/sw.js?v={_PWA_VERSION}')
-                                .then(function (reg) {{
-                  console.log('[PWA] Service Worker registrado. Scope:', reg.scope);
-                                }})
-                                .catch(function (err) {{
-                  console.warn('[PWA] Registro do Service Worker falhou:', err);
-                                }});
-                        }});
-                    }}
-        </script>
+        """
+<link rel="manifest" href="/pwa/manifest.webmanifest?v=5">
+<meta name="theme-color" content="#f5b400">
+<link rel="apple-touch-icon" href="/pwa/icon-192.png?v=5">
         """,
         unsafe_allow_html=True,
     )
@@ -1401,7 +1379,7 @@ def render_dashboard(user: dict) -> None:
 def main() -> None:
     st.set_page_config(
         page_title="Controle Financeiro Web",
-        page_icon=os.path.join(_STATIC_DIR, "icon-192.png") if os.path.exists(os.path.join(_STATIC_DIR, "icon-192.png")) else "💰",
+        page_icon=os.path.join(_PWA_DIR, "icon-192.png") if os.path.exists(os.path.join(_PWA_DIR, "icon-192.png")) else "💰",
         layout="wide",
         initial_sidebar_state="collapsed",
     )
