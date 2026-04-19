@@ -727,6 +727,10 @@ def apply_custom_css() -> None:
 
 
 def render_auth_screen() -> None:
+    # Troca para tela de login solicitada por rerun anterior (evita alterar key de widget ja renderizado)
+    if st.session_state.pop("_pending_switch_to_login", False):
+        st.session_state["auth_mode"] = "Entrar"
+
     st.markdown("<div class='auth-wrap'>", unsafe_allow_html=True)
     st.markdown("<div class='auth-card'>", unsafe_allow_html=True)
     st.markdown("<div class='auth-title'>Controle Financeiro</div>", unsafe_allow_html=True)
@@ -779,7 +783,7 @@ def render_auth_screen() -> None:
                     st.error(mensagem)
                 else:
                     st.success(mensagem + " Agora faca login.")
-                    st.session_state["auth_mode"] = "Entrar"
+                    st.session_state["_pending_switch_to_login"] = True
                     st.rerun()
 
     st.markdown("</div>", unsafe_allow_html=True)
@@ -1027,6 +1031,9 @@ def render_historico(df: pd.DataFrame, user_id: int) -> None:
     st.markdown("<div class='filters-title'>Busca e filtros</div>", unsafe_allow_html=True)
 
     is_mobile = is_mobile_client()
+    def limpar_filtros() -> None:
+        reset_history_filters()
+
     search_col, clear_col = st.columns([0.73, 0.27]) if is_mobile else st.columns([0.84, 0.16])
     search_col.text_input(
         "Buscar na descricao",
@@ -1034,10 +1041,12 @@ def render_historico(df: pd.DataFrame, user_id: int) -> None:
         placeholder="Ex: mercado, aluguel, farmacia...",
         label_visibility="collapsed",
     )
-
-    if clear_col.button("Limpar filtros", key="limpar_filtros_historico", use_container_width=True):
-        reset_history_filters()
-        st.rerun()
+    clear_col.button(
+        "Limpar filtros",
+        key="limpar_filtros_historico",
+        use_container_width=True,
+        on_click=limpar_filtros,
+    )
 
     month_options = ["Todos"]
     categoria_options = ["Todos"]
