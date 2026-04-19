@@ -857,18 +857,18 @@ def inject_pwa() -> None:
                 <meta name="theme-color" content="#f5b400">
                 <link rel="apple-touch-icon" href="/app/static/icon-192.png?v={_PWA_VERSION}">
         <script>
-          if ('serviceWorker' in navigator) {
-            window.addEventListener('load', function () {
+                    if ('serviceWorker' in navigator) {{
+                        window.addEventListener('load', function () {{
               navigator.serviceWorker
                                 .register('/app/static/sw.js?v={_PWA_VERSION}')
-                .then(function (reg) {
+                                .then(function (reg) {{
                   console.log('[PWA] Service Worker registrado. Scope:', reg.scope);
-                })
-                .catch(function (err) {
+                                }})
+                                .catch(function (err) {{
                   console.warn('[PWA] Registro do Service Worker falhou:', err);
-                });
-            });
-          }
+                                }});
+                        }});
+                    }}
         </script>
         """,
         unsafe_allow_html=True,
