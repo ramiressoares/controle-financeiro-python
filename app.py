@@ -62,6 +62,10 @@ def init_db() -> None:
 def init_session_state() -> None:
     st.session_state.setdefault("editing_id", None)
     st.session_state.setdefault("delete_confirm_id", None)
+    st.session_state.setdefault("hist_search", "")
+    st.session_state.setdefault("hist_mes", "Todos")
+    st.session_state.setdefault("hist_categoria", "Todos")
+    st.session_state.setdefault("hist_tipo", "Todos")
 
 
 def reset_action_state() -> None:
@@ -244,6 +248,51 @@ def cancel_delete() -> None:
     st.session_state["delete_confirm_id"] = None
 
 
+def is_mobile_client() -> bool:
+    headers = getattr(st.context, "headers", None)
+    if not headers:
+        return False
+
+    user_agent = str(headers.get("user-agent", "")).lower()
+    mobile_hint = str(headers.get("sec-ch-ua-mobile", "")).lower()
+    mobile_tokens = (
+        "android",
+        "iphone",
+        "ipad",
+        "ipod",
+        "mobile",
+        "opera mini",
+        "iemobile",
+    )
+    return mobile_hint == "?1" or any(token in user_agent for token in mobile_tokens)
+
+
+def render_metric_cards(metrics: dict, total_movimentacoes: int) -> None:
+    st.markdown(
+        f"""
+        <div class='metric-grid'>
+            <div class='metric-card saldo'>
+                <div class='metric-label'>Saldo Atual</div>
+                <div class='metric-value'>{format_brl(metrics['saldo'])}</div>
+            </div>
+            <div class='metric-card receita'>
+                <div class='metric-label'>Receita</div>
+                <div class='metric-value'>{format_brl(metrics['receitas'])}</div>
+            </div>
+            <div class='metric-card despesa'>
+                <div class='metric-label'>Despesa</div>
+                <div class='metric-value'>{format_brl(metrics['despesas'])}</div>
+            </div>
+            <div class='metric-card movimentos'>
+                <div class='metric-label'>Movimentacoes</div>
+                <div class='metric-value'>{total_movimentacoes}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def apply_custom_css() -> None:
     st.markdown(
         """
@@ -255,6 +304,61 @@ def apply_custom_css() -> None:
             padding-top: 1.2rem;
             padding-bottom: 1.8rem;
             max-width: 1080px;
+        }
+        .metric-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 0.85rem;
+            margin: 0.9rem 0 1rem;
+        }
+        .metric-card {
+            position: relative;
+            overflow: hidden;
+            border-radius: 20px;
+            padding: 1rem 1rem 1.05rem;
+            min-height: 116px;
+            border: 1px solid rgba(255,255,255,0.08);
+            box-shadow: 0 18px 32px rgba(0, 0, 0, 0.24);
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+        .metric-card::after {
+            content: "";
+            position: absolute;
+            inset: auto -20px -35px auto;
+            width: 96px;
+            height: 96px;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.10);
+            filter: blur(8px);
+        }
+        .metric-card.saldo {
+            background: linear-gradient(180deg, rgba(23, 92, 65, 0.96) 0%, rgba(16, 61, 43, 0.98) 100%);
+        }
+        .metric-card.receita {
+            background: linear-gradient(180deg, rgba(20, 77, 146, 0.96) 0%, rgba(15, 52, 102, 0.98) 100%);
+        }
+        .metric-card.despesa {
+            background: linear-gradient(180deg, rgba(143, 39, 55, 0.96) 0%, rgba(94, 26, 39, 0.98) 100%);
+        }
+        .metric-card.movimentos {
+            background: linear-gradient(180deg, rgba(92, 54, 162, 0.96) 0%, rgba(59, 33, 106, 0.98) 100%);
+        }
+        .metric-label {
+            color: rgba(244, 247, 255, 0.78);
+            font-size: 0.88rem;
+            font-weight: 600;
+            letter-spacing: 0.01em;
+            text-align: left;
+        }
+        .metric-value {
+            color: #f8fbff;
+            font-size: 1.3rem;
+            line-height: 1.15;
+            font-weight: 800;
+            text-align: left;
+            word-break: break-word;
         }
         .app-card {
             background: linear-gradient(180deg, rgba(24,26,34,0.92) 0%, rgba(14,16,22,0.92) 100%);
@@ -269,12 +373,33 @@ def apply_custom_css() -> None:
             margin-top: -0.35rem;
             margin-bottom: 0.6rem;
         }
+        .filters-card {
+            background: linear-gradient(180deg, rgba(20, 23, 33, 0.95) 0%, rgba(13, 15, 22, 0.96) 100%);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 16px;
+            padding: 0.9rem 0.95rem;
+            margin-bottom: 0.8rem;
+            box-shadow: 0 12px 28px rgba(0, 0, 0, 0.20);
+        }
+        .filters-title {
+            color: #f3f6ff;
+            font-weight: 700;
+            font-size: 0.95rem;
+            margin-bottom: 0.55rem;
+        }
+        .filters-result {
+            color: #aeb8cf;
+            font-size: 0.9rem;
+            margin-top: 0.35rem;
+            margin-bottom: 0.15rem;
+        }
         .history-card {
             background: linear-gradient(180deg, rgba(17, 20, 28, 0.95) 0%, rgba(12, 14, 20, 0.96) 100%);
             border: 1px solid rgba(255, 255, 255, 0.08);
             border-radius: 18px;
             padding: 0.95rem 1rem;
             margin-bottom: 0.8rem;
+            box-shadow: 0 16px 34px rgba(0, 0, 0, 0.22);
         }
         .history-meta {
             display: flex;
@@ -334,6 +459,13 @@ def apply_custom_css() -> None:
             padding: 0.85rem 0.95rem;
             margin-top: 0.75rem;
         }
+        .stTextInput input,
+        .stNumberInput input {
+            min-height: 3rem;
+        }
+        .stSelectbox [data-baseweb="select"] > div {
+            min-height: 3rem;
+        }
         .stButton > button,
         .stFormSubmitButton > button {
             border-radius: 12px;
@@ -346,13 +478,73 @@ def apply_custom_css() -> None:
             width: 100%;
         }
         @media (max-width: 640px) {
+            .block-container {
+                padding-top: 0.8rem;
+                padding-bottom: 1rem;
+                padding-left: 0.8rem;
+                padding-right: 0.8rem;
+            }
+            .metric-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 0.65rem;
+                margin: 0.7rem 0 0.85rem;
+            }
+            .metric-card {
+                min-height: 102px;
+                border-radius: 18px;
+                padding: 0.9rem 0.9rem 0.95rem;
+            }
+            .metric-label {
+                font-size: 0.8rem;
+            }
+            .metric-value {
+                font-size: 1.1rem;
+            }
             .app-card,
             .history-card {
                 padding: 0.9rem;
                 border-radius: 16px;
             }
+            .app-subtitle {
+                margin-bottom: 0.45rem;
+            }
+            .filters-card {
+                border-radius: 14px;
+                padding: 0.85rem;
+                margin-bottom: 0.7rem;
+            }
+            .filters-title {
+                font-size: 0.9rem;
+                margin-bottom: 0.45rem;
+            }
+            .filters-result {
+                font-size: 0.82rem;
+            }
             .history-meta {
                 gap: 0.45rem;
+            }
+            .history-description {
+                font-size: 0.98rem;
+            }
+            .history-category,
+            .history-date {
+                font-size: 0.84rem;
+            }
+            .history-value {
+                font-size: 0.96rem;
+            }
+            .stTextInput input,
+            .stNumberInput input {
+                min-height: 3.2rem;
+                font-size: 1rem;
+            }
+            .stSelectbox [data-baseweb="select"] > div {
+                min-height: 3.2rem;
+                font-size: 1rem;
+            }
+            .stButton > button,
+            .stFormSubmitButton > button {
+                min-height: 3rem;
             }
         }
         </style>
@@ -384,7 +576,7 @@ def render_nova_movimentacao() -> None:
     st.markdown("### Nova movimentacao")
 
     with st.form("nova_movimentacao", clear_on_submit=True):
-        col1, col2 = st.columns(2)
+        col1, col2 = st.columns(2 if not is_mobile_client() else [1, 1])
         tipo = col1.selectbox("Tipo", ["Receita", "Despesa"], index=0)
         categoria = col2.selectbox("Categoria", CATEGORIAS, index=0)
 
@@ -406,7 +598,13 @@ def render_nova_movimentacao() -> None:
 
 
 def render_grafico(df: pd.DataFrame) -> None:
-    st.markdown("### 📈 Evolucao Financeira Mensal")
+    is_mobile = is_mobile_client()
+    titulo_html = (
+        "<h3 style='margin-bottom:0.4rem;font-size:1rem;'>📈 Evolução Mensal</h3>"
+        if is_mobile
+        else "### 📈 Evolução Mensal"
+    )
+    st.markdown(titulo_html, unsafe_allow_html=is_mobile)
     monthly_df = monthly_dataframe(df)
 
     if monthly_df.empty:
@@ -427,7 +625,7 @@ def render_grafico(df: pd.DataFrame) -> None:
         custom_data=["mes_label", "saldo_label"],
     )
     fig.update_traces(
-        width=0.58 if len(monthly_df) == 1 else 0.72,
+        width=0.44 if len(monthly_df) == 1 and is_mobile else 0.58 if len(monthly_df) == 1 else 0.54 if is_mobile else 0.72,
         marker_line_width=0,
         marker=dict(color=monthly_df["cor_barra"].tolist()),
         hovertemplate=(
@@ -440,36 +638,39 @@ def render_grafico(df: pd.DataFrame) -> None:
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         showlegend=False,
-        bargap=0.28 if len(monthly_df) > 1 else 0.72,
+        height=230 if is_mobile else 360,
+        bargap=0.46 if is_mobile and len(monthly_df) > 1 else 0.28 if len(monthly_df) > 1 else 0.8 if is_mobile else 0.72,
         bargroupgap=0.0,
         barcornerradius=10,
         hoverlabel=dict(
             bgcolor="rgba(12,16,24,0.96)",
             bordercolor="rgba(255,255,255,0.10)",
-            font=dict(color="#f5f7ff", size=13),
+            font=dict(color="#f5f7ff", size=11 if is_mobile else 13),
         ),
-        margin=dict(l=10, r=10, t=20, b=10),
+        margin=dict(l=4, r=4, t=8, b=4) if is_mobile else dict(l=10, r=10, t=20, b=10),
         transition=dict(duration=450, easing="cubic-in-out"),
         xaxis=dict(
             title=None,
             type="category",
             categoryorder="array",
             categoryarray=monthly_df["mes_label"].tolist(),
-            tickfont=dict(size=12, color="#b6bdd0"),
+            tickfont=dict(size=10 if is_mobile else 12, color="#b6bdd0"),
             showgrid=False,
             fixedrange=True,
             tickangle=0,
+            automargin=True,
         ),
         yaxis=dict(
             title=None,
             tickprefix="R$ ",
-            tickfont=dict(size=12, color="#b6bdd0"),
+            tickfont=dict(size=10 if is_mobile else 12, color="#b6bdd0"),
             zeroline=True,
             zerolinecolor="rgba(255,255,255,0.14)",
             zerolinewidth=1,
             gridcolor="rgba(255,255,255,0.08)",
             griddash="dot",
             fixedrange=True,
+            automargin=True,
         ),
     )
 
@@ -491,7 +692,7 @@ def render_edit_form(movimento: dict) -> None:
     categoria_atual = movimento["categoria"] if movimento["categoria"] in CATEGORIAS else CATEGORIAS[0]
 
     with st.form(f"form_editar_{movimento['id']}", clear_on_submit=False):
-        col1, col2 = st.columns(2)
+        col1, col2 = st.columns(2 if not is_mobile_client() else [1, 1])
         tipo = col1.selectbox(
             "Tipo",
             ["Receita", "Despesa"],
@@ -567,7 +768,7 @@ def render_movimento_card(row: pd.Series) -> None:
         unsafe_allow_html=True,
     )
 
-    acao_col1, acao_col2 = st.columns(2)
+    acao_col1, acao_col2 = st.columns(2, gap="small")
     if acao_col1.button("✏️ Editar", key=f"editar_btn_{movimento_id}", use_container_width=True):
         start_edit(movimento_id)
         st.rerun()
@@ -578,7 +779,7 @@ def render_movimento_card(row: pd.Series) -> None:
     if st.session_state.get("delete_confirm_id") == movimento_id:
         st.markdown("<div class='confirm-box'>", unsafe_allow_html=True)
         st.warning("Confirmar exclusao desta movimentacao?")
-        confirmar_col1, confirmar_col2 = st.columns(2)
+        confirmar_col1, confirmar_col2 = st.columns(2, gap="small")
         if confirmar_col1.button("Confirmar exclusao", key=f"confirmar_excluir_{movimento_id}", use_container_width=True):
             removido = excluir_movimento(movimento_id)
             if removido:
@@ -606,11 +807,95 @@ def render_historico(df: pd.DataFrame) -> None:
         else:
             render_edit_form(movimento)
 
+    st.markdown("<div class='filters-card'>", unsafe_allow_html=True)
+    st.markdown("<div class='filters-title'>Busca e filtros</div>", unsafe_allow_html=True)
+
+    is_mobile = is_mobile_client()
+    search_col, clear_col = st.columns([0.73, 0.27]) if is_mobile else st.columns([0.84, 0.16])
+    search_col.text_input(
+        "Buscar na descricao",
+        key="hist_search",
+        placeholder="Ex: mercado, aluguel, farmacia...",
+        label_visibility="collapsed",
+    )
+
+    if clear_col.button("Limpar filtros", key="limpar_filtros_historico", use_container_width=True):
+        st.session_state["hist_search"] = ""
+        st.session_state["hist_mes"] = "Todos"
+        st.session_state["hist_categoria"] = "Todos"
+        st.session_state["hist_tipo"] = "Todos"
+        st.rerun()
+
+    month_options = ["Todos"]
+    categoria_options = ["Todos"]
+
+    if not df.empty:
+        month_options.extend(
+            sorted(
+                [m for m in df["data_hora"].dt.strftime("%m/%Y").dropna().unique().tolist() if m],
+                reverse=True,
+            )
+        )
+        categoria_options.extend(sorted(df["categoria"].dropna().astype(str).unique().tolist()))
+
+    tipo_options = ["Todos", "Receita", "Despesa"]
+
+    if st.session_state["hist_mes"] not in month_options:
+        st.session_state["hist_mes"] = "Todos"
+    if st.session_state["hist_categoria"] not in categoria_options:
+        st.session_state["hist_categoria"] = "Todos"
+    if st.session_state["hist_tipo"] not in tipo_options:
+        st.session_state["hist_tipo"] = "Todos"
+
+    if is_mobile:
+        st.selectbox("Mes", month_options, key="hist_mes")
+        st.selectbox("Categoria", categoria_options, key="hist_categoria")
+        st.selectbox("Tipo", tipo_options, key="hist_tipo")
+    else:
+        fcol1, fcol2, fcol3 = st.columns(3)
+        fcol1.selectbox("Mes", month_options, key="hist_mes")
+        fcol2.selectbox("Categoria", categoria_options, key="hist_categoria")
+        fcol3.selectbox("Tipo", tipo_options, key="hist_tipo")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    filtered_df = df.copy()
+    busca = st.session_state["hist_search"].strip().lower()
+    if busca:
+        filtered_df = filtered_df[
+            filtered_df["descricao"].fillna("").astype(str).str.lower().str.contains(busca, na=False)
+        ]
+
+    if st.session_state["hist_mes"] != "Todos":
+        mes_ref = st.session_state["hist_mes"]
+        filtered_df = filtered_df[
+            filtered_df["data_hora"].dt.strftime("%m/%Y") == mes_ref
+        ]
+
+    if st.session_state["hist_categoria"] != "Todos":
+        filtered_df = filtered_df[
+            filtered_df["categoria"].astype(str) == st.session_state["hist_categoria"]
+        ]
+
+    if st.session_state["hist_tipo"] != "Todos":
+        filtered_df = filtered_df[
+            filtered_df["tipo"].astype(str) == st.session_state["hist_tipo"].lower()
+        ]
+
+    st.markdown(
+        f"<div class='filters-result'>{len(filtered_df)} movimentacoes encontradas</div>",
+        unsafe_allow_html=True,
+    )
+
     if df.empty:
         st.info("Nenhuma movimentacao cadastrada.")
         return
 
-    for _, row in df.iterrows():
+    if filtered_df.empty:
+        st.info("Nenhuma movimentacao encontrada para os filtros selecionados.")
+        return
+
+    for _, row in filtered_df.iterrows():
         render_movimento_card(row)
 
 
@@ -621,12 +906,7 @@ def render_dashboard(nome: str) -> None:
     df = load_movimentacoes()
     metrics = compute_metrics(df)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Saldo atual", format_brl(metrics["saldo"]))
-    c2.metric("Receita total", format_brl(metrics["receitas"]))
-    c3.metric("Despesa total", format_brl(metrics["despesas"]))
-    c4.metric("Movimentacoes", f"{len(df)}")
-
+    render_metric_cards(metrics, len(df))
     render_nova_movimentacao()
     render_grafico(df)
     render_historico(df)
