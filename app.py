@@ -3,6 +3,8 @@ import hmac
 import os
 import re
 import sqlite3
+import struct
+import zlib
 from datetime import datetime
 
 import pandas as pd
@@ -21,6 +23,37 @@ CATEGORIAS = [
     "Investimentos",
     "Outros",
 ]
+
+# ── PWA: gerador de icones PNG em Python puro (sem dependencias externas) ──────
+
+_STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+
+def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    crc = zlib.crc32(chunk_type + data) & 0xFFFFFFFF
+    return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", crc)
+
+
+def _create_solid_png(size: int, r: int, g: int, b: int) -> bytes:
+    """Gera um PNG quadrado de cor solida sem dependencias externas."""
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = _png_chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+    row = bytes([0]) + bytes([r, g, b] * size)
+    idat = _png_chunk(b"IDAT", zlib.compress(row * size, 9))
+    iend = _png_chunk(b"IEND", b"")
+    return sig + ihdr + idat + iend
+
+
+def init_pwa_icons() -> None:
+    """Cria icones PNG para a PWA em static/ se ainda nao existirem."""
+    os.makedirs(_STATIC_DIR, exist_ok=True)
+    # Verde #30c48d = (48, 196, 141)
+    for size, filename in [(192, "icon-192.png"), (512, "icon-512.png")]:
+        path = os.path.join(_STATIC_DIR, filename)
+        if not os.path.exists(path):
+            png_data = _create_solid_png(size, 48, 196, 141)
+            with open(path, "wb") as f:
+                f.write(png_data)
 
 
 def get_conn() -> sqlite3.Connection:
@@ -126,6 +159,19 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_movimentacoes_usuario_id ON movimentacoes(usuario_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_usuarios_email ON usuarios(email)")
 
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS metas_mensais (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                usuario_id INTEGER NOT NULL,
+                mes TEXT NOT NULL,
+                valor_meta REAL NOT NULL,
+                UNIQUE(usuario_id, mes),
+                FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
+            )
+            """
+        )
+
         migrate_legacy_data(conn)
 
 
@@ -136,6 +182,7 @@ def init_session_state() -> None:
     st.session_state.setdefault("hist_mes", "Todos")
     st.session_state.setdefault("hist_categoria", "Todos")
     st.session_state.setdefault("hist_tipo", "Todos")
+    st.session_state.setdefault("meta_editing", False)
 
     st.session_state.setdefault("auth_mode", "Entrar")
     st.session_state.setdefault("is_authenticated", False)
@@ -302,6 +349,27 @@ def load_movimentacoes(user_id: int) -> pd.DataFrame:
     df["data_hora"] = pd.to_datetime(df["data_hora"], errors="coerce")
     df["valor"] = pd.to_numeric(df["valor"], errors="coerce").fillna(0.0)
     return df
+
+
+def get_meta_mensal(user_id: int, mes: str) -> float | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT valor_meta FROM metas_mensais WHERE usuario_id = ? AND mes = ?",
+            (user_id, mes),
+        ).fetchone()
+    return float(row["valor_meta"]) if row else None
+
+
+def save_meta_mensal(user_id: int, mes: str, valor_meta: float) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO metas_mensais (usuario_id, mes, valor_meta)
+            VALUES (?, ?, ?)
+            ON CONFLICT(usuario_id, mes) DO UPDATE SET valor_meta = excluded.valor_meta
+            """,
+            (user_id, mes, valor_meta),
+        )
 
 
 def compute_metrics(df: pd.DataFrame) -> dict:
@@ -720,7 +788,86 @@ def apply_custom_css() -> None:
                 min-height: 3rem;
             }
         }
+        .meta-progress-wrap {
+            margin: 0.55rem 0 0.25rem;
+        }
+        .meta-info-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            margin-bottom: 0.55rem;
+        }
+        .meta-status-label {
+            color: #b6bdd0;
+            font-size: 0.92rem;
+            font-weight: 600;
+        }
+        .meta-pct {
+            font-size: 1.35rem;
+            font-weight: 800;
+            line-height: 1;
+        }
+        .meta-bar-bg {
+            background: rgba(255,255,255,0.09);
+            border-radius: 999px;
+            height: 13px;
+            overflow: hidden;
+            margin-bottom: 0.6rem;
+        }
+        .meta-bar-fill {
+            height: 100%;
+            border-radius: 999px;
+            transition: width 0.65s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        .meta-values-row {
+            display: flex;
+            align-items: baseline;
+            gap: 0.38rem;
+            flex-wrap: wrap;
+        }
+        .meta-val-atual {
+            font-size: 1rem;
+            font-weight: 700;
+        }
+        .meta-val-sep {
+            color: #7e8a9e;
+            font-size: 0.85rem;
+        }
+        .meta-val-meta {
+            color: #c4ccd8;
+            font-size: 0.95rem;
+            font-weight: 600;
+        }
         </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def inject_pwa() -> None:
+    """Injeta manifest link, meta tags e registro do Service Worker na pagina."""
+    st.markdown(
+        """
+        <link rel="manifest" href="/app/static/manifest.webmanifest">
+        <meta name="mobile-web-app-capable" content="yes">
+        <meta name="apple-mobile-web-app-capable" content="yes">
+        <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+        <meta name="apple-mobile-web-app-title" content="Financeiro">
+        <meta name="theme-color" content="#0E1117">
+        <script>
+          if ('serviceWorker' in navigator) {
+            window.addEventListener('load', function () {
+              navigator.serviceWorker
+                .register('/app/static/sw.js')
+                .then(function (reg) {
+                  console.log('[PWA] Service Worker registrado. Scope:', reg.scope);
+                })
+                .catch(function (err) {
+                  console.warn('[PWA] Registro do Service Worker falhou:', err);
+                });
+            });
+          }
+        </script>
         """,
         unsafe_allow_html=True,
     )
@@ -1121,6 +1268,113 @@ def render_historico(df: pd.DataFrame, user_id: int) -> None:
         render_movimento_card(row, user_id)
 
 
+def _set_meta_editing_true() -> None:
+    st.session_state["meta_editing"] = True
+
+
+def _set_meta_editing_false() -> None:
+    st.session_state["meta_editing"] = False
+
+
+def render_meta_mensal(df: pd.DataFrame, user_id: int) -> None:
+    mes_atual = datetime.now().strftime("%Y-%m")
+    mes_label = datetime.now().strftime("%m/%Y")
+
+    economizado = 0.0
+    if not df.empty:
+        df_mes = df[df["data_hora"].dt.strftime("%Y-%m") == mes_atual]
+        receitas = float(df_mes.loc[df_mes["tipo"] == "receita", "valor"].sum())
+        despesas = float(df_mes.loc[df_mes["tipo"] == "despesa", "valor"].sum())
+        economizado = receitas - despesas
+
+    meta = get_meta_mensal(user_id, mes_atual)
+    editing = st.session_state.get("meta_editing", False)
+
+    st.markdown("<div class='app-card'>", unsafe_allow_html=True)
+
+    header_col, btn_col = st.columns([0.78, 0.22])
+    header_col.markdown("### 🎯 Meta do mês")
+
+    if meta is not None and not editing:
+        percentual_raw = (economizado / meta * 100) if meta > 0 else 0.0
+        percentual_clamped = min(max(percentual_raw, 0.0), 100.0)
+
+        if percentual_raw >= 100:
+            cor = "#30c48d"
+            status_msg = "✅ Meta atingida!"
+        elif percentual_raw >= 70:
+            cor = "#f9c846"
+            status_msg = "Você está quase lá!"
+        elif economizado >= 0:
+            cor = "#ef5c6d"
+            status_msg = "Continue economizando"
+        else:
+            cor = "#ef5c6d"
+            status_msg = "Saldo negativo no mês"
+
+        btn_col.button(
+            "✏️ Editar",
+            key="meta_alterar_btn",
+            use_container_width=True,
+            on_click=_set_meta_editing_true,
+        )
+
+        st.markdown(
+            f"""
+            <div class='meta-progress-wrap'>
+                <div class='meta-info-row'>
+                    <span class='meta-status-label'>{status_msg}</span>
+                    <span class='meta-pct' style='color:{cor}'>{percentual_raw:.1f}%</span>
+                </div>
+                <div class='meta-bar-bg'>
+                    <div class='meta-bar-fill'
+                         style='width:{percentual_clamped:.2f}%;background:{cor};box-shadow:0 0 10px {cor}66;'>
+                    </div>
+                </div>
+                <div class='meta-values-row'>
+                    <span class='meta-val-atual' style='color:{cor}'>{format_brl(max(economizado, 0.0))}</span>
+                    <span class='meta-val-sep'>economizados de</span>
+                    <span class='meta-val-meta'>{format_brl(meta)}</span>
+                    <span class='meta-val-sep'>em {mes_label}</span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        if editing:
+            btn_col.button(
+                "✕ Cancelar",
+                key="meta_cancelar_btn",
+                use_container_width=True,
+                on_click=_set_meta_editing_false,
+            )
+
+        valor_default = meta if meta is not None else 0.0
+
+        with st.form("form_meta_mensal", clear_on_submit=False):
+            nova_meta = st.number_input(
+                f"Meta de economia para {mes_label} (R$)",
+                min_value=0.0,
+                value=float(valor_default),
+                step=100.0,
+                format="%.2f",
+                help="Quanto você deseja economizar este mês (receitas − despesas)",
+            )
+            salvar = st.form_submit_button("💾 Salvar meta", use_container_width=True)
+
+        if salvar:
+            if nova_meta <= 0:
+                st.error("Informe um valor maior que zero para a meta.")
+            else:
+                save_meta_mensal(user_id, mes_atual, float(nova_meta))
+                st.session_state["meta_editing"] = False
+                st.success("Meta salva com sucesso!")
+                st.rerun()
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
 def render_dashboard(user: dict) -> None:
     user_id = int(user["id"])
 
@@ -1136,6 +1390,7 @@ def render_dashboard(user: dict) -> None:
     metrics = compute_metrics(df)
 
     render_metric_cards(metrics, len(df))
+    render_meta_mensal(df, user_id)
     render_nova_movimentacao(user_id)
     render_grafico(df)
     render_historico(df, user_id)
@@ -1144,14 +1399,16 @@ def render_dashboard(user: dict) -> None:
 def main() -> None:
     st.set_page_config(
         page_title="Controle Financeiro Web",
-        page_icon="icon.png" if os.path.exists("icon.png") else "💰",
+        page_icon=os.path.join(_STATIC_DIR, "icon-192.png") if os.path.exists(os.path.join(_STATIC_DIR, "icon-192.png")) else "💰",
         layout="wide",
         initial_sidebar_state="collapsed",
     )
 
+    init_pwa_icons()
     init_db()
     init_session_state()
     apply_custom_css()
+    inject_pwa()
 
     if not st.session_state["is_authenticated"]:
         render_auth_screen()
