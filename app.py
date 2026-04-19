@@ -2,9 +2,8 @@ import hashlib
 import hmac
 import os
 import re
+import shutil
 import sqlite3
-import struct
-import zlib
 from datetime import datetime
 
 import pandas as pd
@@ -24,36 +23,38 @@ CATEGORIAS = [
     "Outros",
 ]
 
-# ── PWA: gerador de icones PNG em Python puro (sem dependencias externas) ──────
+# ── PWA: sincronizacao dos icones personalizados do projeto ───────────────────
 
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
-
-
-def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
-    crc = zlib.crc32(chunk_type + data) & 0xFFFFFFFF
-    return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", crc)
-
-
-def _create_solid_png(size: int, r: int, g: int, b: int) -> bytes:
-    """Gera um PNG quadrado de cor solida sem dependencias externas."""
-    sig = b"\x89PNG\r\n\x1a\n"
-    ihdr = _png_chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
-    row = bytes([0]) + bytes([r, g, b] * size)
-    idat = _png_chunk(b"IDAT", zlib.compress(row * size, 9))
-    iend = _png_chunk(b"IEND", b"")
-    return sig + ihdr + idat + iend
+_PWA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pwa")
+_PWA_VERSION = "3"
 
 
 def init_pwa_icons() -> None:
-    """Cria icones PNG para a PWA em static/ se ainda nao existirem."""
+    """Sincroniza icones personalizados da pasta pwa/ para static/."""
     os.makedirs(_STATIC_DIR, exist_ok=True)
-    # Verde #30c48d = (48, 196, 141)
-    for size, filename in [(192, "icon-192.png"), (512, "icon-512.png")]:
-        path = os.path.join(_STATIC_DIR, filename)
-        if not os.path.exists(path):
-            png_data = _create_solid_png(size, 48, 196, 141)
-            with open(path, "wb") as f:
-                f.write(png_data)
+    os.makedirs(_PWA_DIR, exist_ok=True)
+
+    source_map = {
+        "icon-192.png": [
+            os.path.join(_PWA_DIR, "icon-192.png"),
+            os.path.join(_PWA_DIR, "app financeiro (2).png"),
+        ],
+        "icon-512.png": [
+            os.path.join(_PWA_DIR, "icon-512.png"),
+            os.path.join(_PWA_DIR, "app financeiro (1).png"),
+        ],
+    }
+
+    for filename, candidates in source_map.items():
+        source_path = next((candidate for candidate in candidates if os.path.exists(candidate)), None)
+        static_path = os.path.join(_STATIC_DIR, filename)
+        pwa_path = os.path.join(_PWA_DIR, filename)
+
+        if source_path is not None:
+            if os.path.abspath(source_path) != os.path.abspath(pwa_path):
+                shutil.copyfile(source_path, pwa_path)
+            shutil.copyfile(pwa_path, static_path)
 
 
 def get_conn() -> sqlite3.Connection:
@@ -847,18 +848,19 @@ def apply_custom_css() -> None:
 def inject_pwa() -> None:
     """Injeta manifest link, meta tags e registro do Service Worker na pagina."""
     st.markdown(
-        """
-        <link rel="manifest" href="/app/static/manifest.webmanifest">
+                f"""
+                <link rel="manifest" href="/app/static/manifest.webmanifest?v={_PWA_VERSION}">
         <meta name="mobile-web-app-capable" content="yes">
         <meta name="apple-mobile-web-app-capable" content="yes">
         <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-        <meta name="apple-mobile-web-app-title" content="Financeiro">
-        <meta name="theme-color" content="#0E1117">
+                <meta name="apple-mobile-web-app-title" content="Controle Financeiro">
+                <meta name="theme-color" content="#f5b400">
+                <link rel="apple-touch-icon" href="/app/static/icon-192.png?v={_PWA_VERSION}">
         <script>
           if ('serviceWorker' in navigator) {
             window.addEventListener('load', function () {
               navigator.serviceWorker
-                .register('/app/static/sw.js')
+                                .register('/app/static/sw.js?v={_PWA_VERSION}')
                 .then(function (reg) {
                   console.log('[PWA] Service Worker registrado. Scope:', reg.scope);
                 })
