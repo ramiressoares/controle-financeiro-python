@@ -10,6 +10,7 @@ import plotly.express as px
 import streamlit as st
 
 DB_PATH = "controle_financeiro.db"
+TODOS_OS_MESES = "Todos os meses"
 CATEGORIAS = [
     "Alimentacao",
     "Transporte",
@@ -176,7 +177,7 @@ def init_session_state() -> None:
     st.session_state.setdefault("editing_id", None)
     st.session_state.setdefault("delete_confirm_id", None)
     st.session_state.setdefault("hist_search", "")
-    st.session_state.setdefault("hist_mes", "Todos")
+    st.session_state.setdefault("hist_mes", TODOS_OS_MESES)
     st.session_state.setdefault("hist_categoria", "Todos")
     st.session_state.setdefault("hist_tipo", "Todos")
     st.session_state.setdefault("meta_editing", False)
@@ -195,7 +196,7 @@ def reset_action_state() -> None:
 
 def reset_history_filters() -> None:
     st.session_state["hist_search"] = ""
-    st.session_state["hist_mes"] = "Todos"
+    st.session_state["hist_mes"] = TODOS_OS_MESES
     st.session_state["hist_categoria"] = "Todos"
     st.session_state["hist_tipo"] = "Todos"
 
@@ -1175,7 +1176,7 @@ def render_historico(df: pd.DataFrame, user_id: int) -> None:
         on_click=limpar_filtros,
     )
 
-    month_options = ["Todos"]
+    month_options = [TODOS_OS_MESES]
     categoria_options = ["Todos"]
 
     if not df.empty:
@@ -1190,7 +1191,7 @@ def render_historico(df: pd.DataFrame, user_id: int) -> None:
     tipo_options = ["Todos", "Receita", "Despesa"]
 
     if st.session_state["hist_mes"] not in month_options:
-        st.session_state["hist_mes"] = "Todos"
+        st.session_state["hist_mes"] = TODOS_OS_MESES
     if st.session_state["hist_categoria"] not in categoria_options:
         st.session_state["hist_categoria"] = "Todos"
     if st.session_state["hist_tipo"] not in tipo_options:
@@ -1215,7 +1216,7 @@ def render_historico(df: pd.DataFrame, user_id: int) -> None:
             filtered_df["descricao"].fillna("").astype(str).str.lower().str.contains(busca, na=False)
         ]
 
-    if st.session_state["hist_mes"] != "Todos":
+    if st.session_state["hist_mes"] != TODOS_OS_MESES:
         mes_ref = st.session_state["hist_mes"]
         filtered_df = filtered_df[
             filtered_df["data_hora"].dt.strftime("%m/%Y") == mes_ref
@@ -1231,8 +1232,18 @@ def render_historico(df: pd.DataFrame, user_id: int) -> None:
             filtered_df["tipo"].astype(str) == st.session_state["hist_tipo"].lower()
         ]
 
+    total_filtrado = float(filtered_df["valor"].sum()) if not filtered_df.empty else 0.0
+    if st.session_state["hist_categoria"] != "Todos" and st.session_state["hist_mes"] != TODOS_OS_MESES:
+        resumo_total = "Total da categoria no mês"
+    elif st.session_state["hist_categoria"] != "Todos":
+        resumo_total = "Total da categoria"
+    elif st.session_state["hist_mes"] != TODOS_OS_MESES:
+        resumo_total = "Total do mês"
+    else:
+        resumo_total = "Total filtrado"
+
     st.markdown(
-        f"<div class='filters-result'>{len(filtered_df)} movimentacoes encontradas</div>",
+        f"<div class='filters-result'>{len(filtered_df)} movimentacoes encontradas | {resumo_total}: {format_brl(total_filtrado)}</div>",
         unsafe_allow_html=True,
     )
 
