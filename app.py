@@ -1,5 +1,8 @@
+import base64
 import hashlib
 import hmac
+import io
+import json
 import os
 import re
 import sqlite3
@@ -8,6 +11,12 @@ from datetime import datetime
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import streamlit.components.v1 as components
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 DB_PATH = "controle_financeiro.db"
 TODOS_OS_MESES = "Todos os meses"
@@ -170,6 +179,24 @@ def init_db() -> None:
             """
         )
 
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS orcamentos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                usuario_id INTEGER NOT NULL,
+                categoria TEXT NOT NULL,
+                mes TEXT NOT NULL,
+                valor_orcamento REAL NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(usuario_id, categoria, mes),
+                FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
+            )
+            """
+        )
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_orcamentos_usuario_mes ON orcamentos(usuario_id, mes)")
+
         migrate_legacy_data(conn)
 
 
@@ -199,6 +226,95 @@ def reset_history_filters() -> None:
     st.session_state["hist_mes"] = TODOS_OS_MESES
     st.session_state["hist_categoria"] = "Todos"
     st.session_state["hist_tipo"] = "Todos"
+
+
+def _orcamentos_file_path(user_id: int) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), f"orcamentos_usuario_{user_id}.json")
+
+
+def _migrar_orcamentos_json_para_sqlite(user_id: int, mes: str) -> None:
+    """Migra orcamentos antigos em JSON para SQLite sem apagar dados existentes."""
+    path = _orcamentos_file_path(user_id)
+    if not os.path.exists(path):
+        return
+
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+    except (json.JSONDecodeError, OSError, ValueError):
+        return
+
+    if not isinstance(data, dict):
+        return
+
+    houve_migracao = False
+    for categoria, valor in data.items():
+        categoria_limpa = str(categoria).strip()
+        if categoria_limpa not in CATEGORIAS:
+            continue
+        try:
+            valor_float = float(valor)
+        except (TypeError, ValueError):
+            continue
+
+        if valor_float > 0:
+            salvar_orcamento(user_id=user_id, categoria=categoria_limpa, mes=mes, valor_orcamento=valor_float)
+            houve_migracao = True
+
+    if houve_migracao:
+        try:
+            os.replace(path, f"{path}.migrado")
+        except OSError:
+            # Se nao for possivel renomear, mantem o arquivo sem interromper o fluxo.
+            pass
+
+
+def load_orcamentos(user_id: int, mes: str) -> dict[str, float]:
+    _migrar_orcamentos_json_para_sqlite(user_id, mes)
+
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT categoria, valor_orcamento
+            FROM orcamentos
+            WHERE usuario_id = ? AND mes = ?
+            ORDER BY categoria ASC
+            """,
+            (user_id, mes),
+        ).fetchall()
+
+    return {
+        str(row["categoria"]): float(row["valor_orcamento"])
+        for row in rows
+        if str(row["categoria"]) in CATEGORIAS and float(row["valor_orcamento"]) > 0
+    }
+
+
+def salvar_orcamento(user_id: int, categoria: str, mes: str, valor_orcamento: float) -> None:
+    if categoria not in CATEGORIAS:
+        return
+    if valor_orcamento <= 0:
+        return
+
+    agora = datetime.now().isoformat(timespec="seconds")
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO orcamentos (usuario_id, categoria, mes, valor_orcamento, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(usuario_id, categoria, mes)
+            DO UPDATE SET valor_orcamento = excluded.valor_orcamento, updated_at = excluded.updated_at
+            """,
+            (user_id, categoria, mes, float(valor_orcamento), agora, agora),
+        )
+
+
+def excluir_orcamento(user_id: int, categoria: str, mes: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM orcamentos WHERE usuario_id = ? AND categoria = ? AND mes = ?",
+            (user_id, categoria, mes),
+        )
 
 
 def set_logged_user(user: dict) -> None:
@@ -496,6 +612,492 @@ def render_metric_cards(metrics: dict, total_movimentacoes: int) -> None:
     )
 
 
+def filtrar_historico(
+    df: pd.DataFrame,
+    busca: str,
+    mes: str,
+    categoria: str,
+    tipo: str,
+) -> pd.DataFrame:
+    filtered_df = df.copy()
+
+    busca_limpa = busca.strip().lower()
+    if busca_limpa:
+        filtered_df = filtered_df[
+            filtered_df["descricao"].fillna("").astype(str).str.lower().str.contains(busca_limpa, na=False)
+        ]
+
+    if mes != TODOS_OS_MESES:
+        filtered_df = filtered_df[
+            filtered_df["data_hora"].dt.strftime("%m/%Y") == mes
+        ]
+
+    if categoria != "Todos":
+        filtered_df = filtered_df[
+            filtered_df["categoria"].astype(str) == categoria
+        ]
+
+    if tipo != "Todos":
+        filtered_df = filtered_df[
+            filtered_df["tipo"].astype(str) == tipo.lower()
+        ]
+
+    return filtered_df
+
+
+def _status_orcamento(percentual: float) -> tuple[str, str]:
+    if percentual <= 70:
+        return "Dentro do planejado", "#30c48d"
+    if percentual <= 100:
+        return "Em alerta", "#f9c846"
+    return "Acima do orcamento", "#ef5c6d"
+
+
+def _dados_mensais(df: pd.DataFrame, ano_mes: str) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    return df[df["data_hora"].dt.strftime("%Y-%m") == ano_mes].copy()
+
+
+def _dados_despesas_mes(df_mes: pd.DataFrame) -> pd.DataFrame:
+    if df_mes.empty:
+        return df_mes.copy()
+    return df_mes[df_mes["tipo"].astype(str).str.lower() == "despesa"].copy()
+
+
+def render_orcamentos(df: pd.DataFrame, user_id: int) -> None:
+    st.markdown("### Orcamentos")
+    st.markdown("<div class='app-card'>", unsafe_allow_html=True)
+    st.markdown("Defina seu orcamento mensal por categoria e acompanhe a execucao em tempo real.")
+
+    mes_ref = datetime.now().strftime("%Y-%m")
+    mes_label = datetime.now().strftime("%m/%Y")
+    orcamentos = load_orcamentos(user_id, mes_ref)
+
+    with st.form("novo_orcamento_form", clear_on_submit=True):
+        col1, col2 = st.columns(2 if not is_mobile_client() else [1, 1])
+        categoria = col1.selectbox("Categoria do orcamento", CATEGORIAS, index=0)
+        valor_orcamento = col2.number_input("Valor mensal (R$)", min_value=0.0, step=50.0, format="%.2f")
+        salvar = st.form_submit_button("Salvar orcamento", use_container_width=True)
+
+    if salvar:
+        if valor_orcamento <= 0:
+            st.error("Informe um valor maior que zero para o orcamento.")
+        else:
+            salvar_orcamento(user_id=user_id, categoria=categoria, mes=mes_ref, valor_orcamento=float(valor_orcamento))
+            st.success(f"Orcamento salvo para {categoria}.")
+            st.rerun()
+
+    df_mes = _dados_mensais(df, mes_ref)
+    despesas_mes = _dados_despesas_mes(df_mes)
+    gasto_por_categoria = (
+        despesas_mes.groupby("categoria", as_index=False)["valor"].sum() if not despesas_mes.empty else pd.DataFrame(columns=["categoria", "valor"])
+    )
+    mapa_gastos = {
+        str(row["categoria"]): float(row["valor"]) for _, row in gasto_por_categoria.iterrows()
+    }
+
+    if not orcamentos:
+        st.info("Nenhum orcamento cadastrado ainda.")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    st.markdown(f"#### Acompanhamento de {mes_label}")
+
+    for categoria_nome in sorted(orcamentos.keys()):
+        valor_limite = float(orcamentos[categoria_nome])
+        valor_gasto = float(mapa_gastos.get(categoria_nome, 0.0))
+        percentual = (valor_gasto / valor_limite * 100.0) if valor_limite > 0 else 0.0
+        percentual_clamped = max(0.0, min(percentual, 100.0))
+        status, cor = _status_orcamento(percentual)
+
+        st.markdown("<div class='budget-card'>", unsafe_allow_html=True)
+        st.markdown(
+            f"""
+            <div class='budget-head'>
+                <div class='budget-title'>{categoria_nome}</div>
+                <div class='budget-status' style='color:{cor}'>{status}</div>
+            </div>
+            <div class='budget-values'>
+                <span>Gasto: {format_brl(valor_gasto)}</span>
+                <span>Orcamento: {format_brl(valor_limite)}</span>
+                <span>Uso: {percentual:.1f}%</span>
+            </div>
+            <div class='budget-bar-bg'>
+                <div class='budget-bar-fill' style='width:{percentual_clamped:.2f}%; background:{cor};'></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        bcol1, bcol2 = st.columns(2)
+        edit_key = f"orc_edit_{categoria_nome}"
+        if bcol1.button("Editar", key=f"btn_{edit_key}", use_container_width=True):
+            st.session_state[edit_key] = True
+            st.rerun()
+
+        if bcol2.button("Excluir", key=f"btn_del_{categoria_nome}", use_container_width=True):
+            excluir_orcamento(user_id=user_id, categoria=categoria_nome, mes=mes_ref)
+            st.success(f"Orcamento removido para {categoria_nome}.")
+            st.rerun()
+
+        if st.session_state.get(edit_key, False):
+            novo_valor = st.number_input(
+                f"Novo valor para {categoria_nome}",
+                min_value=0.0,
+                value=float(valor_limite),
+                step=50.0,
+                format="%.2f",
+                key=f"input_{edit_key}",
+            )
+            ecol1, ecol2 = st.columns(2)
+            if ecol1.button("Salvar alteracao", key=f"save_{edit_key}", use_container_width=True):
+                if novo_valor <= 0:
+                    st.error("Informe um valor maior que zero.")
+                else:
+                    salvar_orcamento(
+                        user_id=user_id,
+                        categoria=categoria_nome,
+                        mes=mes_ref,
+                        valor_orcamento=float(novo_valor),
+                    )
+                    st.session_state[edit_key] = False
+                    st.success("Orcamento atualizado.")
+                    st.rerun()
+
+            if ecol2.button("Cancelar", key=f"cancel_{edit_key}", use_container_width=True):
+                st.session_state[edit_key] = False
+                st.rerun()
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_resumo_financeiro(df: pd.DataFrame, user_id: int) -> None:
+    del user_id  # reservado para evolucoes futuras sem quebrar assinatura
+    st.markdown("### Resumo Financeiro")
+
+    mes_atual = datetime.now().strftime("%Y-%m")
+    mes_anterior = (pd.Period(mes_atual, freq="M") - 1).strftime("%Y-%m")
+
+    df_mes_atual = _dados_mensais(df, mes_atual)
+    df_mes_anterior = _dados_mensais(df, mes_anterior)
+
+    receitas_mes = df_mes_atual[df_mes_atual["tipo"] == "receita"] if not df_mes_atual.empty else df_mes_atual
+    despesas_mes = df_mes_atual[df_mes_atual["tipo"] == "despesa"] if not df_mes_atual.empty else df_mes_atual
+
+    receita_total = float(receitas_mes["valor"].sum()) if not receitas_mes.empty else 0.0
+    despesa_total = float(despesas_mes["valor"].sum()) if not despesas_mes.empty else 0.0
+    saldo_mes = receita_total - despesa_total
+    qtd_receitas = int(len(receitas_mes))
+    qtd_despesas = int(len(despesas_mes))
+
+    if not despesas_mes.empty:
+        gasto_categoria = despesas_mes.groupby("categoria", as_index=False)["valor"].sum().sort_values("valor", ascending=False)
+        maior_categoria = str(gasto_categoria.iloc[0]["categoria"])
+        valor_maior_categoria = float(gasto_categoria.iloc[0]["valor"])
+        maior_despesa = float(despesas_mes["valor"].max())
+        menor_despesa = float(despesas_mes["valor"].min())
+        top5 = despesas_mes.nlargest(5, "valor")[ ["descricao", "categoria", "valor", "data_hora"] ]
+    else:
+        gasto_categoria = pd.DataFrame(columns=["categoria", "valor"])
+        maior_categoria = "Sem despesas no mes"
+        valor_maior_categoria = 0.0
+        maior_despesa = 0.0
+        menor_despesa = 0.0
+        top5 = pd.DataFrame(columns=["descricao", "categoria", "valor", "data_hora"])
+
+    dia_atual = max(1, datetime.now().day)
+    media_diaria_gastos = despesa_total / float(dia_atual)
+
+    metricas_anterior = compute_metrics(df_mes_anterior)
+    saldo_anterior = float(metricas_anterior["saldo"])
+
+    ano_atual = datetime.now().strftime("%Y")
+    df_ano = df[df["data_hora"].dt.strftime("%Y") == ano_atual] if not df.empty else df
+    total_economizado_ano = float(compute_metrics(df_ano)["saldo"]) if not df_ano.empty else 0.0
+
+    def _card_resumo(titulo: str, valor: str) -> None:
+        st.markdown(
+            f"""
+            <div class='summary-card'>
+                <div class='summary-label'>{titulo}</div>
+                <div class='summary-value'>{valor}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        _card_resumo("Receita do mes", format_brl(receita_total))
+    with c2:
+        _card_resumo("Despesas do mes", format_brl(despesa_total))
+    with c3:
+        _card_resumo("Saldo do mes", format_brl(saldo_mes))
+
+    c4, c5, c6 = st.columns(3)
+    with c4:
+        _card_resumo("Quantidade de receitas", str(qtd_receitas))
+    with c5:
+        _card_resumo("Quantidade de despesas", str(qtd_despesas))
+    with c6:
+        _card_resumo("Media diaria de gastos", format_brl(media_diaria_gastos))
+
+    c7, c8, c9 = st.columns(3)
+    with c7:
+        _card_resumo("Categoria com maior gasto", maior_categoria)
+    with c8:
+        _card_resumo("Valor da maior categoria", format_brl(valor_maior_categoria))
+    with c9:
+        _card_resumo("Total economizado no ano", format_brl(total_economizado_ano))
+
+    c10, c11, c12 = st.columns(3)
+    with c10:
+        _card_resumo("Maior despesa", format_brl(maior_despesa))
+    with c11:
+        _card_resumo("Menor despesa", format_brl(menor_despesa))
+    with c12:
+        variacao_saldo = saldo_mes - saldo_anterior
+        _card_resumo("Comparativo saldo mes anterior", f"{format_brl(variacao_saldo)}")
+
+    st.markdown("<div class='app-card'>", unsafe_allow_html=True)
+    st.markdown("#### Cinco maiores gastos do mes")
+    if top5.empty:
+        st.info("Sem despesas no mes atual.")
+    else:
+        top5_exibicao = top5.copy()
+        top5_exibicao["data_hora"] = top5_exibicao["data_hora"].map(format_data_hora)
+        top5_exibicao["valor"] = top5_exibicao["valor"].map(format_brl)
+        top5_exibicao = top5_exibicao.rename(
+            columns={"descricao": "Descricao", "categoria": "Categoria", "valor": "Valor", "data_hora": "Data"}
+        )
+        st.dataframe(top5_exibicao, use_container_width=True, hide_index=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    g1, g2 = st.columns(2)
+
+    with g1:
+        st.markdown("#### Pizza de gastos por categoria")
+        if gasto_categoria.empty:
+            st.info("Sem despesas para gerar o grafico de pizza.")
+        else:
+            fig_pizza = px.pie(
+                gasto_categoria,
+                names="categoria",
+                values="valor",
+                hole=0.45,
+                color_discrete_sequence=["#ef5c6d", "#f9c846", "#30c48d", "#4f7fff", "#9a6dff", "#66c2a5"],
+            )
+            fig_pizza.update_layout(
+                template="plotly_dark",
+                margin=dict(l=8, r=8, t=16, b=8),
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                legend_title_text="Categoria",
+            )
+            st.plotly_chart(fig_pizza, use_container_width=True)
+
+    with g2:
+        st.markdown("#### Barras: receitas x despesas")
+        comparativo_df = pd.DataFrame(
+            {
+                "tipo": ["Receitas", "Despesas"],
+                "valor": [receita_total, despesa_total],
+            }
+        )
+        fig_barras = px.bar(
+            comparativo_df,
+            x="tipo",
+            y="valor",
+            color="tipo",
+            color_discrete_map={"Receitas": "#30c48d", "Despesas": "#ef5c6d"},
+            text="valor",
+        )
+        fig_barras.update_traces(texttemplate="R$ %{text:.2f}", textposition="outside")
+        fig_barras.update_layout(
+            template="plotly_dark",
+            margin=dict(l=8, r=8, t=16, b=8),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            showlegend=False,
+            yaxis_title="Valor (R$)",
+            xaxis_title="",
+        )
+        st.plotly_chart(fig_barras, use_container_width=True)
+
+    st.markdown("#### Evolucao dos ultimos 12 meses")
+    if df.empty:
+        st.info("Sem dados para a evolucao mensal.")
+        return
+
+    serie = df.copy()
+    serie["mes_ref"] = serie["data_hora"].dt.to_period("M").astype(str)
+    serie["receita_val"] = serie.apply(lambda row: float(row["valor"]) if row["tipo"] == "receita" else 0.0, axis=1)
+    serie["despesa_val"] = serie.apply(lambda row: float(row["valor"]) if row["tipo"] == "despesa" else 0.0, axis=1)
+
+    evolucao = (
+        serie.groupby("mes_ref", as_index=False)[["receita_val", "despesa_val"]]
+        .sum()
+        .sort_values("mes_ref")
+        .tail(12)
+    )
+    evolucao["saldo"] = evolucao["receita_val"] - evolucao["despesa_val"]
+    evolucao["mes_label"] = pd.PeriodIndex(evolucao["mes_ref"], freq="M").strftime("%m/%Y")
+
+    fig_linha = px.line(
+        evolucao,
+        x="mes_label",
+        y=["receita_val", "despesa_val", "saldo"],
+        markers=True,
+        color_discrete_map={
+            "receita_val": "#30c48d",
+            "despesa_val": "#ef5c6d",
+            "saldo": "#4f7fff",
+        },
+    )
+    fig_linha.update_traces(mode="lines+markers")
+    fig_linha.update_layout(
+        template="plotly_dark",
+        margin=dict(l=8, r=8, t=16, b=8),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        yaxis_title="Valor (R$)",
+        xaxis_title="Mes",
+        legend_title_text="Serie",
+    )
+    st.plotly_chart(fig_linha, use_container_width=True)
+
+
+def gerar_pdf_historico(
+    filtered_df: pd.DataFrame,
+    mes_selecionado: str,
+    categoria_selecionada: str,
+    tipo_selecionado: str,
+) -> bytes:
+    metricas = compute_metrics(filtered_df)
+    categoria_label = "Todas" if categoria_selecionada == "Todos" else categoria_selecionada
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=14 * mm,
+        rightMargin=14 * mm,
+        topMargin=12 * mm,
+        bottomMargin=12 * mm,
+        title="Relatorio do historico",
+    )
+    styles = getSampleStyleSheet()
+
+    elementos = [
+        Paragraph("Relatorio de movimentacoes", styles["Title"]),
+        Spacer(1, 4 * mm),
+        Paragraph(f"Mes de referencia: {mes_selecionado}", styles["Normal"]),
+        Paragraph(f"Categoria selecionada: {categoria_label}", styles["Normal"]),
+        Paragraph(f"Tipo selecionado: {tipo_selecionado}", styles["Normal"]),
+        Paragraph(f"Total de receitas: {format_brl(metricas['receitas'])}", styles["Normal"]),
+        Paragraph(f"Total de despesas: {format_brl(metricas['despesas'])}", styles["Normal"]),
+        Paragraph(f"Saldo da selecao: {format_brl(metricas['saldo'])}", styles["Normal"]),
+        Paragraph(f"Quantidade de lancamentos exportados: {len(filtered_df)}", styles["Normal"]),
+        Spacer(1, 6 * mm),
+    ]
+
+    tabela = [["Data", "Tipo", "Descricao", "Categoria", "Valor"]]
+    for _, row in filtered_df.iterrows():
+        tipo_raw = str(row["tipo"]).lower()
+        tipo_label = "Receita" if tipo_raw == "receita" else "Despesa"
+        valor_assinado = float(row["valor"]) if tipo_raw == "receita" else -float(row["valor"])
+        tabela.append(
+            [
+                format_data_hora(row["data_hora"]),
+                tipo_label,
+                str(row["descricao"]),
+                str(row["categoria"]),
+                format_brl(valor_assinado),
+            ]
+        )
+
+    tabela_pdf = Table(
+        tabela,
+        colWidths=[26 * mm, 22 * mm, 62 * mm, 34 * mm, 30 * mm],
+        repeatRows=1,
+    )
+    tabela_pdf.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2a44")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f4f6fb")]),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#c3cadb")),
+                ("ALIGN", (4, 1), (4, -1), "RIGHT"),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ]
+        )
+    )
+    elementos.append(tabela_pdf)
+
+    doc.build(elementos)
+    return buffer.getvalue()
+
+
+def compartilhar_pdf_whatsapp(pdf_bytes: bytes, nome_arquivo: str, mensagem: str) -> None:
+    pdf_b64 = base64.b64encode(pdf_bytes).decode("ascii")
+    mensagem_js = mensagem.replace("\\", "\\\\").replace("'", "\\'")
+    nome_js = nome_arquivo.replace("\\", "\\\\").replace("'", "\\'")
+
+    components.html(
+        f"""
+        <script>
+        (async () => {{
+            const pdfBase64 = '{pdf_b64}';
+            const fileName = '{nome_js}';
+            const texto = '{mensagem_js}';
+
+            const toUint8 = (base64) => {{
+                const binary = atob(base64);
+                const len = binary.length;
+                const bytes = new Uint8Array(len);
+                for (let i = 0; i < len; i += 1) bytes[i] = binary.charCodeAt(i);
+                return bytes;
+            }};
+
+            let compartilhou = false;
+            try {{
+                if (navigator.share && navigator.canShare) {{
+                    const blob = new Blob([toUint8(pdfBase64)], {{ type: 'application/pdf' }});
+                    const file = new File([blob], fileName, {{ type: 'application/pdf' }});
+                    if (navigator.canShare({{ files: [file] }})) {{
+                        await navigator.share({{
+                            title: 'Relatorio Financeiro',
+                            text: texto,
+                            files: [file],
+                        }});
+                        compartilhou = true;
+                    }}
+                }}
+            }} catch (e) {{
+                compartilhou = false;
+            }}
+
+            if (!compartilhou) {{
+                const url = 'https://wa.me/?text=' + encodeURIComponent(texto);
+                window.open(url, '_blank');
+            }}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+
 def apply_custom_css() -> None:
     st.markdown(
         """
@@ -617,6 +1219,17 @@ def apply_custom_css() -> None:
             font-size: 0.9rem;
             margin-top: 0.35rem;
             margin-bottom: 0.15rem;
+        }
+        .export-summary-card {
+            background: linear-gradient(180deg, rgba(21, 27, 40, 0.92) 0%, rgba(14, 19, 30, 0.94) 100%);
+            border: 1px solid rgba(255, 255, 255, 0.10);
+            border-radius: 14px;
+            padding: 0.78rem 0.9rem;
+            margin-top: 0.5rem;
+            margin-bottom: 0.7rem;
+            color: #f3f6ff;
+            font-size: 0.94rem;
+            font-weight: 700;
         }
         .history-card {
             background: linear-gradient(180deg, rgba(17, 20, 28, 0.95) 0%, rgba(12, 14, 20, 0.96) 100%);
@@ -835,6 +1448,77 @@ def apply_custom_css() -> None:
             color: #c4ccd8;
             font-size: 0.95rem;
             font-weight: 600;
+        }
+        .budget-card {
+            background: linear-gradient(180deg, rgba(17, 20, 28, 0.95) 0%, rgba(12, 14, 20, 0.96) 100%);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 16px;
+            padding: 0.82rem 0.92rem;
+            margin-top: 0.65rem;
+            margin-bottom: 0.2rem;
+        }
+        .budget-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.7rem;
+            margin-bottom: 0.45rem;
+            flex-wrap: wrap;
+        }
+        .budget-title {
+            color: #f5f7ff;
+            font-size: 0.98rem;
+            font-weight: 700;
+        }
+        .budget-status {
+            font-size: 0.86rem;
+            font-weight: 700;
+        }
+        .budget-values {
+            color: #b8c2d9;
+            font-size: 0.86rem;
+            display: flex;
+            justify-content: space-between;
+            gap: 0.5rem;
+            margin-bottom: 0.45rem;
+            flex-wrap: wrap;
+        }
+        .budget-bar-bg {
+            width: 100%;
+            height: 11px;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.10);
+            overflow: hidden;
+            margin-bottom: 0.28rem;
+        }
+        .budget-bar-fill {
+            height: 100%;
+            border-radius: 999px;
+            transition: width 0.5s ease;
+        }
+        .summary-card {
+            background: linear-gradient(180deg, rgba(20, 23, 33, 0.95) 0%, rgba(13, 15, 22, 0.96) 100%);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 16px;
+            padding: 0.84rem 0.9rem;
+            margin-bottom: 0.65rem;
+            min-height: 98px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            box-shadow: 0 10px 28px rgba(0, 0, 0, 0.18);
+        }
+        .summary-label {
+            color: #b7c1d7;
+            font-size: 0.84rem;
+            font-weight: 600;
+        }
+        .summary-value {
+            color: #f6f8ff;
+            font-size: 1.05rem;
+            font-weight: 800;
+            line-height: 1.2;
+            word-break: break-word;
         }
         </style>
         """,
@@ -1209,35 +1893,26 @@ def render_historico(df: pd.DataFrame, user_id: int) -> None:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-    filtered_df = df.copy()
-    busca = st.session_state["hist_search"].strip().lower()
-    if busca:
-        filtered_df = filtered_df[
-            filtered_df["descricao"].fillna("").astype(str).str.lower().str.contains(busca, na=False)
-        ]
+    mes_selecionado = st.session_state["hist_mes"]
+    categoria_selecionada = st.session_state["hist_categoria"]
+    tipo_selecionado = st.session_state["hist_tipo"]
 
-    if st.session_state["hist_mes"] != TODOS_OS_MESES:
-        mes_ref = st.session_state["hist_mes"]
-        filtered_df = filtered_df[
-            filtered_df["data_hora"].dt.strftime("%m/%Y") == mes_ref
-        ]
+    filtered_df = filtrar_historico(
+        df=df,
+        busca=st.session_state["hist_search"],
+        mes=mes_selecionado,
+        categoria=categoria_selecionada,
+        tipo=tipo_selecionado,
+    )
 
-    if st.session_state["hist_categoria"] != "Todos":
-        filtered_df = filtered_df[
-            filtered_df["categoria"].astype(str) == st.session_state["hist_categoria"]
-        ]
+    metricas_filtradas = compute_metrics(filtered_df)
+    total_filtrado = metricas_filtradas["saldo"]
 
-    if st.session_state["hist_tipo"] != "Todos":
-        filtered_df = filtered_df[
-            filtered_df["tipo"].astype(str) == st.session_state["hist_tipo"].lower()
-        ]
-
-    total_filtrado = float(filtered_df["valor"].sum()) if not filtered_df.empty else 0.0
-    if st.session_state["hist_categoria"] != "Todos" and st.session_state["hist_mes"] != TODOS_OS_MESES:
+    if categoria_selecionada != "Todos" and mes_selecionado != TODOS_OS_MESES:
         resumo_total = "Total da categoria no mês"
-    elif st.session_state["hist_categoria"] != "Todos":
+    elif categoria_selecionada != "Todos":
         resumo_total = "Total da categoria"
-    elif st.session_state["hist_mes"] != TODOS_OS_MESES:
+    elif mes_selecionado != TODOS_OS_MESES:
         resumo_total = "Total do mês"
     else:
         resumo_total = "Total filtrado"
@@ -1254,6 +1929,53 @@ def render_historico(df: pd.DataFrame, user_id: int) -> None:
     if filtered_df.empty:
         st.info("Nenhuma movimentacao encontrada para os filtros selecionados.")
         return
+
+    nome_pdf = f"relatorio_historico_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+    pdf_bytes = gerar_pdf_historico(
+        filtered_df=filtered_df,
+        mes_selecionado=mes_selecionado,
+        categoria_selecionada=categoria_selecionada,
+        tipo_selecionado=tipo_selecionado,
+    )
+
+    st.markdown("<div class='app-card'>", unsafe_allow_html=True)
+    st.markdown("### Relatorio filtrado")
+
+    st.download_button(
+        "Baixar PDF mensal",
+        data=pdf_bytes,
+        file_name=nome_pdf,
+        mime="application/pdf",
+        key="baixar_pdf_historico",
+        use_container_width=True,
+    )
+
+    if categoria_selecionada != "Todos":
+        texto_resumo_card = f"Total da categoria: {format_brl(metricas_filtradas['saldo'])}"
+    else:
+        texto_resumo_card = f"Total geral do mes: {format_brl(metricas_filtradas['saldo'])}"
+
+    st.markdown(
+        f"<div class='export-summary-card'>{texto_resumo_card}</div>",
+        unsafe_allow_html=True,
+    )
+
+    if st.button("Enviar pelo WhatsApp", key="enviar_whatsapp_pdf", use_container_width=True):
+        categoria_label = "Todas" if categoria_selecionada == "Todos" else categoria_selecionada
+        mensagem_whatsapp = (
+            f"Relatorio financeiro - Mes: {mes_selecionado} | "
+            f"Categoria: {categoria_label} | "
+            f"Receitas: {format_brl(metricas_filtradas['receitas'])} | "
+            f"Despesas: {format_brl(metricas_filtradas['despesas'])} | "
+            f"Saldo: {format_brl(metricas_filtradas['saldo'])} | "
+            f"Lancamentos: {len(filtered_df)}"
+        )
+        compartilhar_pdf_whatsapp(pdf_bytes=pdf_bytes, nome_arquivo=nome_pdf, mensagem=mensagem_whatsapp)
+        st.info(
+            "Tentando compartilhar o PDF. Se o anexo nao for suportado no navegador, o WhatsApp sera aberto para voce escolher o contato."
+        )
+
+    st.markdown("</div>", unsafe_allow_html=True)
 
     for _, row in filtered_df.iterrows():
         render_movimento_card(row, user_id)
@@ -1380,11 +2102,20 @@ def render_dashboard(user: dict) -> None:
     df = load_movimentacoes(user_id)
     metrics = compute_metrics(df)
 
-    render_metric_cards(metrics, len(df))
-    render_meta_mensal(df, user_id)
-    render_nova_movimentacao(user_id)
-    render_grafico(df)
-    render_historico(df, user_id)
+    abas = st.tabs(["Painel", "Orcamentos", "Resumo Financeiro"])
+
+    with abas[0]:
+        render_metric_cards(metrics, len(df))
+        render_meta_mensal(df, user_id)
+        render_nova_movimentacao(user_id)
+        render_grafico(df)
+        render_historico(df, user_id)
+
+    with abas[1]:
+        render_orcamentos(df, user_id)
+
+    with abas[2]:
+        render_resumo_financeiro(df, user_id)
 
 
 def main() -> None:
